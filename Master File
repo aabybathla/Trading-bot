@@ -71,43 +71,13 @@ class TradingAI:
                 trade_data.to_csv(self.trade_history_file, index=False)
                 logger.info("✅ trade_history.csv updated with missing columns.")
 
-    def generate_sample_trade_data(self):
-        """Generate sample trade data if the file is empty."""
-        trade_data = pd.read_csv(self.trade_history_file)
-        if trade_data.empty:
-            logger.info("🔄 Generating sample trade data...")
-            sample_data = {
-                "Timestamp": ["2023-10-01 12:00:00", "2023-10-01 13:00:00"],
-                "Order_ID": [1, 2],
-                "Symbol": ["EURUSD", "EURUSD"],
-                "Type": ["Buy", "Sell"],
-                "Entry_Price": [1.1000, 1.1050],
-                "Stop_Loss": [1.0950, 1.1100],
-                "Take_Profit": [1.1100, 1.1000],
-                "Pips": [100, -50],
-                "Profit": [100, -50],
-                "RSI": [55, 45],
-                "MACD": [0.002, -0.001],
-                "ATR": [0.005, 0.004],
-                "ADX": [25, 20],
-                "VWAP": [1.100, 1.105],
-                "Correlation": [0.8, 0.7],
-                "News_Sentiment": [0.5, -0.2],
-                "Volatility": [0.01, 0.02],
-                "Seasonal_Trend": [0.002, -0.001],
-                "Order_Flow": [0.001, -0.002]
-            }
-            sample_df = pd.DataFrame(sample_data)
-            sample_df.to_csv(self.trade_history_file, index=False)
-            logger.info("✅ Sample trade data generated.")
-
     def calculate_atr(self, symbol, timeframe, period=14):
         """Calculate the Average True Range (ATR) for a given symbol and timeframe."""
         try:
             # Fetch historical data
             rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, period + 50)
             if rates is None:
-                logger.error(f"❌ Failed to fetch data for {symbol}.")
+                logger.error(f"❌ Failed to fetch data for {symbol}. MT5 Error: {mt5.last_error()}")
                 return None
             if len(rates) < period:
                 logger.error(f"❌ Not enough data to calculate ATR for {symbol}. Required: {period}, Available: {len(rates)}")
@@ -115,31 +85,125 @@ class TradingAI:
             
             # Convert to DataFrame
             df = pd.DataFrame(rates)
-            if df.empty or df.isnull().values.any():
+            logger.debug(f"Fetched data for {symbol}:\n{df.head()}")  # Log the first few rows of data
+            
+            # Check for NaN values
+            if df.isnull().values.any():
                 logger.error(f"❌ Invalid data (NaN values) for {symbol}.")
                 return None
             
             # Ensure the DataFrame has the required columns
             required_columns = ['high', 'low', 'close']
             if not all(col in df.columns for col in required_columns):
-                logger.error(f"❌ Missing required columns in data for {symbol}.")
+                logger.error(f"❌ Missing required columns in data for {symbol}. Available columns: {df.columns}")
                 return None
+            
+            # Calculate True Range (TR)
+            df['prev_close'] = df['close'].shift(1)  # Previous close
+            df['TR'] = df.apply(lambda row: max(
+                row['high'] - row['low'],
+                abs(row['high'] - row['prev_close']),
+                abs(row['low'] - row['prev_close'])
+            ), axis=1)
             
             # Calculate ATR
-            atr_values = talib.ATR(df['high'], df['low'], df['close'], timeperiod=period)
-            if atr_values is None or len(atr_values) == 0:
-                logger.error(f"❌ ATR calculation failed for {symbol}.")
-                return None
-            
-            # Ensure atr_values is not empty before accessing the last element
-            if len(atr_values) > 0:
-                return atr_values[-1]  # Safely access the last element
-            else:
-                logger.error(f"❌ ATR values are empty for {symbol}.")
-                return None
+            atr = df['TR'].rolling(window=period).mean().iloc[-1]  # Use the last value
+            logger.info(f"✅ ATR calculated for {symbol}: {atr}")
+            return atr
         except Exception as e:
             logger.error(f"❌ Unexpected error in calculate_atr for {symbol}: {e}")
             return None
+
+    def calculate_position_size(self, symbol):
+        """Use a fixed position size of 5."""
+        return 5.0  # Fixed position size
+
+    def place_trade(self, order_type, symbol):
+        """Place a trade with a fixed position size."""
+        try:
+            # Confidence threshold (e.g., 0.7 means 70% confidence)
+            confidence_threshold = 0.7
+
+            # Get model predictions
+            features = self.get_features(symbol)
+            if features is None:
+                logger.error(f"❌ Skipping trade for {symbol} due to insufficient data.")
+                return
+
+            # Check if LightGBM model is available
+            if self.lgb_model is None:
+                logger.warning("⚠️ LightGBM model is not loaded. Skipping trade.")
+                return
+
+            trend_direction = self.ensemble_prediction(features)
+            confidence = self.lgb_model.predict(features)[0]  # Confidence score from LightGBM
+
+            # Filter trades based on confidence
+            if confidence < confidence_threshold:
+                logger.warning(f"⚠️ Skipping trade for {symbol} due to low confidence: {confidence:.2f}")
+                return
+
+            # Match profitable patterns
+            if not self.match_pattern(features):
+                logger.warning(f"⚠️ Skipping trade for {symbol} due to no matching profitable pattern.")
+                return
+
+            # Calculate risk-reward ratio
+            atr = self.calculate_atr(symbol, mt5.TIMEFRAME_H1)
+            if not atr:
+                logger.error(f"❌ Failed to calculate ATR for {symbol}.")
+                return
+
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                logger.error(f"❌ Failed to fetch tick data for {symbol}.")
+                return
+
+            price = tick.ask if order_type == 0 else tick.bid
+            stop_loss = round(price - atr * 2.5, 5) if order_type == 0 else round(price + atr * 2.5, 5)
+            take_profit = round(price + atr * 5, 5) if order_type == 0 else round(price - atr * 5, 5)
+
+            risk_reward_ratio = abs(take_profit - price) / abs(price - stop_loss)
+            if risk_reward_ratio < 2:  # Minimum risk-reward ratio of 2:1
+                logger.warning(f"⚠️ Skipping trade for {symbol} due to poor risk-reward ratio: {risk_reward_ratio:.2f}")
+                return
+
+            # Use fixed position size
+            position_size = self.calculate_position_size(symbol)
+            logger.info(f"📊 Trade Details for {symbol}:")
+            logger.info(f"  - Position Size: {position_size}")
+
+            # Check margin requirements
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None:
+                logger.error(f"❌ Failed to fetch symbol info for {symbol}.")
+                return
+
+            margin_required = position_size * symbol_info.margin_initial
+            if margin_required > account_info.margin_free:
+                logger.error(f"❌ Insufficient margin for {symbol}. Required: {margin_required}, Free: {account_info.margin_free}")
+                return
+
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": position_size,
+                "type": mt5.ORDER_TYPE_BUY if order_type == 0 else mt5.ORDER_TYPE_SELL,
+                "price": price,
+                "sl": stop_loss,
+                "tp": take_profit,
+                "deviation": 10,
+                "magic": 123456,
+                "comment": "AI Trading Bot",
+            }
+
+            result = mt5.order_send(request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                logger.info(f"✅ Trade Executed: {symbol} | Volume: {position_size} | SL: {stop_loss:.5f} | TP: {take_profit:.5f}")
+            else:
+                logger.error(f"❌ Trade execution failed for {symbol}. Error: {result.comment}")
+        except Exception as e:
+            logger.error(f"❌ Unexpected error in place_trade for {symbol}: {e}")
 
     def load_models(self):
         """Load pre-trained AI models."""
@@ -297,7 +361,7 @@ class TradingAI:
         df = pd.DataFrame(rates)
         df['RSI'] = talib.RSI(df['close'], timeperiod=14)
         df['MACD'], _, _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
-        df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+        df['ATR'] = self.calculate_atr(symbol, mt5.TIMEFRAME_M15)  # Use the updated ATR function
         df['ADX'] = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
         df['VWAP'] = (df['close'] + df['low'] + df['high']) / 3
         df['Correlation'] = df['close'].rolling(window=10).corr(df['open'])
@@ -349,128 +413,6 @@ class TradingAI:
         except Exception as e:
             logger.error(f"❌ Error in ensemble_prediction: {e}")
             return np.random.choice([0, 1])
-
-    def calculate_position_size(self, symbol, risk_percent=0.01):
-        """Calculate position size based on account balance and risk percentage."""
-        account_info = mt5.account_info()
-        symbol_info = mt5.symbol_info(symbol)
-        if not account_info or not symbol_info:
-            logger.error(f"❌ No account or symbol info for {symbol}.")
-            return None
-        
-        atr = self.calculate_atr(symbol, mt5.TIMEFRAME_H1)
-        if not atr:
-            logger.error(f"❌ Failed to calculate ATR for {symbol}.")
-            return None
-        
-        # Calculate risk amount
-        risk_amount = account_info.balance * risk_percent
-        
-        # Calculate pip value
-        pip_value = (10 ** -symbol_info.digits) * (10 if "JPY" not in symbol else 1)
-        
-        # Calculate position size
-        position_size = risk_amount / (atr * pip_value)
-        
-        # Ensure position size is within broker limits
-        position_size = max(symbol_info.volume_min, min(position_size, symbol_info.volume_max))
-        
-        # Ensure position size does not exceed free margin
-        margin_required = position_size * symbol_info.margin_initial
-        if margin_required > account_info.margin_free:
-            logger.error(f"❌ Insufficient margin for {symbol}. Required: {margin_required}, Free: {account_info.margin_free}")
-            return None
-        
-        return round(position_size / symbol_info.volume_step) * symbol_info.volume_step
-
-    def place_trade(self, order_type, symbol):
-        """Place a trade with dynamic position sizing and risk management."""
-        try:
-            # Confidence threshold (e.g., 0.7 means 70% confidence)
-            confidence_threshold = 0.7
-
-            # Get model predictions
-            features = self.get_features(symbol)
-            if features is None:
-                logger.error(f"❌ Skipping trade for {symbol} due to insufficient data.")
-                return
-
-            # Check if LightGBM model is available
-            if self.lgb_model is None:
-                logger.warning("⚠️ LightGBM model is not loaded. Skipping trade.")
-                return
-
-            trend_direction = self.ensemble_prediction(features)
-            confidence = self.lgb_model.predict(features)[0]  # Confidence score from LightGBM
-
-            # Filter trades based on confidence
-            if confidence < confidence_threshold:
-                logger.warning(f"⚠️ Skipping trade for {symbol} due to low confidence: {confidence:.2f}")
-                return
-
-            # Match profitable patterns
-            if not self.match_pattern(features):
-                logger.warning(f"⚠️ Skipping trade for {symbol} due to no matching profitable pattern.")
-                return
-
-            # Calculate risk-reward ratio
-            atr = self.calculate_atr(symbol, mt5.TIMEFRAME_H1)
-            if not atr:
-                logger.error(f"❌ Failed to calculate ATR for {symbol}.")
-                return
-
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                logger.error(f"❌ Failed to fetch tick data for {symbol}.")
-                return
-
-            price = tick.ask if order_type == 0 else tick.bid
-            stop_loss = round(price - atr * 2.5, 5) if order_type == 0 else round(price + atr * 2.5, 5)
-            take_profit = round(price + atr * 5, 5) if order_type == 0 else round(price - atr * 5, 5)
-
-            risk_reward_ratio = abs(take_profit - price) / abs(price - stop_loss)
-            if risk_reward_ratio < 2:  # Minimum risk-reward ratio of 2:1
-                logger.warning(f"⚠️ Skipping trade for {symbol} due to poor risk-reward ratio: {risk_reward_ratio:.2f}")
-                return
-
-            # Calculate position size
-            position_size = self.calculate_position_size(symbol, risk_percent=0.01)  # Reduced risk to 1%
-            if position_size is None:
-                logger.error(f"❌ Invalid position size for {symbol}. Skipping trade.")
-                return
-
-            # Check margin requirements
-            symbol_info = mt5.symbol_info(symbol)
-            margin_required = position_size * symbol_info.margin_initial
-            if margin_required > account_info.margin_free:
-                logger.error(f"❌ Insufficient margin for {symbol}. Required: {margin_required}, Free: {account_info.margin_free}")
-                return
-
-            logger.info(f"📊 Trade Details for {symbol}:")
-            logger.info(f"  - Position Size: {position_size}")
-            logger.info(f"  - Margin Required: {margin_required}")
-            logger.info(f"  - Free Margin: {account_info.margin_free}")
-
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": position_size,
-                "type": mt5.ORDER_TYPE_BUY if order_type == 0 else mt5.ORDER_TYPE_SELL,
-                "price": price,
-                "sl": stop_loss,
-                "tp": take_profit,
-                "deviation": 10,
-                "magic": 123456,
-                "comment": "AI Trading Bot",
-            }
-
-            result = mt5.order_send(request)
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
-                logger.info(f"✅ Trade Executed: {symbol} | Volume: {position_size} | SL: {stop_loss:.5f} | TP: {take_profit:.5f}")
-            else:
-                logger.error(f"❌ Trade execution failed for {symbol}. Error: {result.comment}")
-        except Exception as e:
-            logger.error(f"❌ Unexpected error in place_trade for {symbol}: {e}")
 
 # ✅ Train LightGBM Model if it doesn't exist
 def train_lgb_model():
