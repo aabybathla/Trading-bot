@@ -1,0 +1,539 @@
+import MetaTrader5 as mt5
+import time
+import os
+import joblib
+import pandas as pd
+import requests
+import numpy as np
+import talib
+import lightgbm as lgb
+from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ✅ Replace with your NewsAPI.org API Key
+NEWS_API_KEY = "d8bb1988d35a46ea98d7256acff01753"
+
+# ✅ Connect to MetaTrader 5
+def connect_to_mt5():
+    if not mt5.initialize():
+        logger.error(f"Failed to initialize MT5: {mt5.last_error()}")
+        exit()
+    logger.info("✅ Connected to MetaTrader 5!")
+
+connect_to_mt5()
+
+# ✅ Check Account Info
+account_info = mt5.account_info()
+if account_info is None:
+    logger.error("Failed to fetch account info.")
+else:
+    logger.info(f"✅ Account Balance: {account_info.balance}")
+    logger.info(f"✅ Account Equity: {account_info.equity}")
+    logger.info(f"✅ Free Margin: {account_info.margin_free}")
+    logger.info(f"✅ Account Leverage: 1:{account_info.leverage}")
+
+class TradingAI:
+    def __init__(self):
+        self.trade_history_file = os.path.join(os.getcwd(), "trade_history.csv")
+        self.ensure_csv_exists()  # Ensure the CSV file exists
+        self.lgb_model = None
+        self.gbm_model = None
+        self.pattern_model = None
+        self.scaler = MinMaxScaler()
+        self.load_models()  # Ensure AI models are loaded
+        self.load_pattern_model()  # Load pattern recognition model
+
+    def ensure_csv_exists(self):
+        """Ensure that the trade history CSV file exists and has the required columns."""
+        required_columns = [
+            "Timestamp", "Order_ID", "Symbol", "Type", "Entry_Price", "Stop_Loss", 
+            "Take_Profit", "Pips", "Profit", "RSI", "MACD", "ATR", "ADX", "VWAP", 
+            "Correlation", "News_Sentiment", "Volatility", "Seasonal_Trend", "Order_Flow"
+        ]
+        
+        if not os.path.exists(self.trade_history_file):
+            logger.info("🔄 Creating trade history file with required columns...")
+            pd.DataFrame(columns=required_columns).to_csv(self.trade_history_file, index=False)
+        else:
+            # Check if the file has all required columns
+            trade_data = pd.read_csv(self.trade_history_file)
+            missing_columns = [col for col in required_columns if col not in trade_data.columns]
+            if missing_columns:
+                logger.warning(f"⚠️ Missing columns detected in trade history: {missing_columns}. Fixing...")
+                for col in missing_columns:
+                    trade_data[col] = np.nan  # Fill missing columns with NaN
+                trade_data.to_csv(self.trade_history_file, index=False)
+                logger.info("✅ trade_history.csv updated with missing columns.")
+
+    def generate_sample_trade_data(self):
+        """Generate sample trade data if the file is empty."""
+        trade_data = pd.read_csv(self.trade_history_file)
+        if trade_data.empty:
+            logger.info("🔄 Generating sample trade data...")
+            sample_data = {
+                "Timestamp": ["2023-10-01 12:00:00", "2023-10-01 13:00:00"],
+                "Order_ID": [1, 2],
+                "Symbol": ["EURUSD", "EURUSD"],
+                "Type": ["Buy", "Sell"],
+                "Entry_Price": [1.1000, 1.1050],
+                "Stop_Loss": [1.0950, 1.1100],
+                "Take_Profit": [1.1100, 1.1000],
+                "Pips": [100, -50],
+                "Profit": [100, -50],
+                "RSI": [55, 45],
+                "MACD": [0.002, -0.001],
+                "ATR": [0.005, 0.004],
+                "ADX": [25, 20],
+                "VWAP": [1.100, 1.105],
+                "Correlation": [0.8, 0.7],
+                "News_Sentiment": [0.5, -0.2],
+                "Volatility": [0.01, 0.02],
+                "Seasonal_Trend": [0.002, -0.001],
+                "Order_Flow": [0.001, -0.002]
+            }
+            sample_df = pd.DataFrame(sample_data)
+            sample_df.to_csv(self.trade_history_file, index=False)
+            logger.info("✅ Sample trade data generated.")
+
+    def calculate_atr(self, symbol, timeframe, period=14):
+        """Calculate the Average True Range (ATR) for a given symbol and timeframe."""
+        try:
+            # Fetch historical data
+            rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, period + 50)
+            if rates is None:
+                logger.error(f"❌ Failed to fetch data for {symbol}.")
+                return None
+            if len(rates) < period:
+                logger.error(f"❌ Not enough data to calculate ATR for {symbol}. Required: {period}, Available: {len(rates)}")
+                return None
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(rates)
+            if df.empty or df.isnull().values.any():
+                logger.error(f"❌ Invalid data (NaN values) for {symbol}.")
+                return None
+            
+            # Ensure the DataFrame has the required columns
+            required_columns = ['high', 'low', 'close']
+            if not all(col in df.columns for col in required_columns):
+                logger.error(f"❌ Missing required columns in data for {symbol}.")
+                return None
+            
+            # Calculate ATR
+            atr_values = talib.ATR(df['high'], df['low'], df['close'], timeperiod=period)
+            if atr_values is None or len(atr_values) == 0:
+                logger.error(f"❌ ATR calculation failed for {symbol}.")
+                return None
+            
+            # Ensure atr_values is not empty before accessing the last element
+            if len(atr_values) > 0:
+                return atr_values[-1]  # Safely access the last element
+            else:
+                logger.error(f"❌ ATR values are empty for {symbol}.")
+                return None
+        except Exception as e:
+            logger.error(f"❌ Unexpected error in calculate_atr for {symbol}: {e}")
+            return None
+
+    def load_models(self):
+        """Load pre-trained AI models."""
+        logger.info("🔄 Loading AI Models...")
+        if os.path.exists("lgb_model.txt"):
+            try:
+                self.lgb_model = lgb.Booster(model_file="lgb_model.txt")
+                logger.info("✅ LightGBM Model loaded successfully")
+            except Exception as e:
+                logger.error(f"❌ Error loading LightGBM model: {e}")
+                self.lgb_model = None
+
+        if os.path.exists("gbm_model.pkl"):
+            try:
+                self.gbm_model = joblib.load("gbm_model.pkl")
+                logger.info("✅ Gradient Boosting model loaded successfully")
+            except Exception as e:
+                logger.error(f"❌ Error loading Gradient Boosting model: {e}")
+                self.gbm_model = None
+
+    def load_pattern_model(self):
+        """Load or train a pattern recognition model."""
+        if os.path.exists("pattern_model.pkl"):
+            self.pattern_model = joblib.load("pattern_model.pkl")
+            logger.info("✅ Pattern recognition model loaded.")
+        else:
+            self.train_pattern_model()
+
+    def train_pattern_model(self):
+        """Train a K-Means clustering model on historical trades."""
+        trade_data = pd.read_csv(self.trade_history_file)
+
+        if trade_data.empty:
+            logger.warning("⚠️ No trade history available for pattern recognition.")
+            return
+
+        # Use features from profitable trades
+        profitable_trades = trade_data[trade_data["Profit"] > 0]
+        if len(profitable_trades) < 2:  # Ensure at least 2 trades exist
+            logger.warning("⚠️ Not enough profitable trades to train pattern model. Skipping training.")
+            return
+
+        feature_columns = [
+            "RSI", "MACD", "ATR", "ADX", "VWAP", "Correlation", 
+            "News_Sentiment", "Volatility", "Seasonal_Trend", "Order_Flow"
+        ]
+        X = profitable_trades[feature_columns].values
+
+        # Ensure we do not request more clusters than available data points
+        num_clusters = min(5, len(profitable_trades))  
+        if num_clusters < 2:
+            logger.warning("⚠️ Not enough unique trades for clustering. Skipping training.")
+            return
+
+        # Train K-Means clustering
+        self.pattern_model = KMeans(n_clusters=num_clusters, random_state=42)
+        self.pattern_model.fit(X)
+        joblib.dump(self.pattern_model, "pattern_model.pkl")
+        logger.info(f"✅ Pattern recognition model trained with {num_clusters} clusters and saved.")
+
+    def match_pattern(self, features):
+        """Match current features to historical profitable patterns."""
+        if self.pattern_model is None:
+            return False
+
+        cluster = self.pattern_model.predict(features)
+        return cluster in [0, 1]  # Example: Only allow trades matching clusters 0 or 1
+
+    def update_trade_rewards(self):
+        """Update trade history with reward-based learning."""
+        trade_data = pd.read_csv(self.trade_history_file)
+        trade_data['Reward'] = trade_data['Profit'].apply(lambda x: 1 if x > 0 else -1)
+        trade_data.to_csv(self.trade_history_file, index=False)
+        logger.info("✅ Trade rewards updated based on profitability.")
+
+    def update_lgb_model(self):
+        """Update the LightGBM model with new trade data."""
+        trade_data = pd.read_csv(self.trade_history_file)
+        if trade_data.empty:
+            logger.warning("⚠️ No trade history available for updating the model.")
+            return
+        
+        feature_columns = [
+            "RSI", "MACD", "ATR", "ADX", "VWAP", "Correlation", 
+            "News_Sentiment", "Volatility", "Seasonal_Trend", "Order_Flow"
+        ]
+        X = trade_data[feature_columns].values
+        y = (trade_data["Profit"] > 0).astype(int).values  # Binary classification
+        
+        # Update the model with new data
+        if self.lgb_model is not None:
+            self.lgb_model = lgb.train(
+                params={
+                    'objective': 'binary',
+                    'metric': 'binary_logloss',
+                    'boosting_type': 'gbdt',
+                    'num_leaves': 31,
+                    'learning_rate': 0.05,
+                    'feature_fraction': 0.9
+                },
+                train_set=lgb.Dataset(X, label=y),
+                init_model=self.lgb_model,  # Continue training from the existing model
+                num_boost_round=50
+            )
+            self.lgb_model.save_model("lgb_model.txt")
+            logger.info("✅ LightGBM Model Updated with New Trade Data!")
+
+    def get_news_sentiment(self, symbol):
+        """Fetch news sentiment for the given symbol."""
+        try:
+            response = requests.get(f"https://newsapi.org/v2/everything?q={symbol}&apiKey={NEWS_API_KEY}")
+            response.raise_for_status()
+            news_data = response.json()
+            sentiment_score = 0
+            for article in news_data["articles"]:
+                if "positive" in article["title"].lower():
+                    sentiment_score += 1
+                elif "negative" in article["title"].lower():
+                    sentiment_score -= 1
+            return sentiment_score / len(news_data["articles"]) if news_data["articles"] else 0
+        except Exception as e:
+            logger.error(f"❌ Error fetching news sentiment: {e}")
+            return 0
+
+    def check_economic_events(self):
+        """Check for high-impact economic events."""
+        url = f"https://www.alphavantage.co/query?function=ECONOMIC_CALENDAR&apikey={NEWS_API_KEY}"
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            events = response.json()
+
+            # Check if the response contains the expected data
+            if "data" not in events:
+                logger.warning("⚠️ No economic event data found in the API response.")
+                return False
+
+            # Filter high-impact events
+            high_impact_events = [event for event in events["data"] if event["impact"] == "high"]
+            if high_impact_events:
+                logger.warning("⚠️ High-impact economic events detected. Skipping trades.")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"❌ Error fetching economic events: {e}")
+            return False
+
+    def get_features(self, symbol):
+        """Fetch and calculate advanced features for the given symbol."""
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 100)
+        if rates is None or len(rates) < 50:
+            logger.error(f"❌ Not enough data to compute features for {symbol}")
+            return None
+        
+        df = pd.DataFrame(rates)
+        df['RSI'] = talib.RSI(df['close'], timeperiod=14)
+        df['MACD'], _, _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+        df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+        df['ADX'] = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
+        df['VWAP'] = (df['close'] + df['low'] + df['high']) / 3
+        df['Correlation'] = df['close'].rolling(window=10).corr(df['open'])
+        df['News_Sentiment'] = self.get_news_sentiment(symbol)  # Fetch news sentiment
+        df['Volatility'] = df['ATR'] / df['VWAP']
+
+        # Advanced Features
+        df['Seasonal_Trend'] = df['close'].rolling(window=30).mean() - df['close'].rolling(window=90).mean()
+        df['Order_Flow'] = df['tick_volume'].diff()  # Example: Volume imbalance
+
+        # Ensure only 10 features are returned
+        latest_features = df.iloc[-1][[
+            "RSI", "MACD", "ATR", "ADX", "VWAP", "Correlation", 
+            "News_Sentiment", "Volatility", "Seasonal_Trend", "Order_Flow"
+        ]].values
+        return latest_features.reshape(1, -1)
+
+    def ensemble_prediction(self, features):
+        """Combine predictions from multiple models."""
+        if self.lgb_model is None or self.gbm_model is None:
+            logger.warning("⚠️ One or more models are not loaded. Using random prediction.")
+            return np.random.choice([0, 1])
+
+        # Ensure the feature order and count match the model training data
+        expected_features_lgb = [
+            "RSI", "MACD", "ATR", "ADX", "VWAP", "Correlation", 
+            "News_Sentiment", "Volatility", "Seasonal_Trend", "Order_Flow"
+        ]
+        expected_features_gbm = [
+            "RSI", "MACD", "ATR", "ADX", "VWAP", "Correlation", 
+            "News_Sentiment", "Volatility"
+        ]
+
+        # Create feature dictionaries
+        feature_dict = dict(zip(expected_features_lgb, features[0]))
+
+        # Prepare features for LightGBM (10 features)
+        features_lgb = np.array([[feature_dict[f] for f in expected_features_lgb]])
+
+        # Prepare features for Gradient Boosting (8 features)
+        features_gbm = np.array([[feature_dict[f] for f in expected_features_gbm]])
+
+        # Make predictions
+        try:
+            lgb_prediction = self.lgb_model.predict(features_lgb)[0]
+            gbm_prediction = self.gbm_model.predict(features_gbm)[0]
+            final_prediction = (lgb_prediction + gbm_prediction) / 2  # Average predictions
+            return 1 if final_prediction > 0.5 else 0
+        except Exception as e:
+            logger.error(f"❌ Error in ensemble_prediction: {e}")
+            return np.random.choice([0, 1])
+
+    def calculate_position_size(self, symbol, risk_percent=0.01):
+        """Calculate position size based on account balance and risk percentage."""
+        account_info = mt5.account_info()
+        symbol_info = mt5.symbol_info(symbol)
+        if not account_info or not symbol_info:
+            logger.error(f"❌ No account or symbol info for {symbol}.")
+            return None
+        
+        atr = self.calculate_atr(symbol, mt5.TIMEFRAME_H1)
+        if not atr:
+            logger.error(f"❌ Failed to calculate ATR for {symbol}.")
+            return None
+        
+        # Calculate risk amount
+        risk_amount = account_info.balance * risk_percent
+        
+        # Calculate pip value
+        pip_value = (10 ** -symbol_info.digits) * (10 if "JPY" not in symbol else 1)
+        
+        # Calculate position size
+        position_size = risk_amount / (atr * pip_value)
+        
+        # Ensure position size is within broker limits
+        position_size = max(symbol_info.volume_min, min(position_size, symbol_info.volume_max))
+        
+        # Ensure position size does not exceed free margin
+        margin_required = position_size * symbol_info.margin_initial
+        if margin_required > account_info.margin_free:
+            logger.error(f"❌ Insufficient margin for {symbol}. Required: {margin_required}, Free: {account_info.margin_free}")
+            return None
+        
+        return round(position_size / symbol_info.volume_step) * symbol_info.volume_step
+
+    def place_trade(self, order_type, symbol):
+        """Place a trade with dynamic position sizing and risk management."""
+        try:
+            # Confidence threshold (e.g., 0.7 means 70% confidence)
+            confidence_threshold = 0.7
+
+            # Get model predictions
+            features = self.get_features(symbol)
+            if features is None:
+                logger.error(f"❌ Skipping trade for {symbol} due to insufficient data.")
+                return
+
+            # Check if LightGBM model is available
+            if self.lgb_model is None:
+                logger.warning("⚠️ LightGBM model is not loaded. Skipping trade.")
+                return
+
+            trend_direction = self.ensemble_prediction(features)
+            confidence = self.lgb_model.predict(features)[0]  # Confidence score from LightGBM
+
+            # Filter trades based on confidence
+            if confidence < confidence_threshold:
+                logger.warning(f"⚠️ Skipping trade for {symbol} due to low confidence: {confidence:.2f}")
+                return
+
+            # Match profitable patterns
+            if not self.match_pattern(features):
+                logger.warning(f"⚠️ Skipping trade for {symbol} due to no matching profitable pattern.")
+                return
+
+            # Calculate risk-reward ratio
+            atr = self.calculate_atr(symbol, mt5.TIMEFRAME_H1)
+            if not atr:
+                logger.error(f"❌ Failed to calculate ATR for {symbol}.")
+                return
+
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                logger.error(f"❌ Failed to fetch tick data for {symbol}.")
+                return
+
+            price = tick.ask if order_type == 0 else tick.bid
+            stop_loss = round(price - atr * 2.5, 5) if order_type == 0 else round(price + atr * 2.5, 5)
+            take_profit = round(price + atr * 5, 5) if order_type == 0 else round(price - atr * 5, 5)
+
+            risk_reward_ratio = abs(take_profit - price) / abs(price - stop_loss)
+            if risk_reward_ratio < 2:  # Minimum risk-reward ratio of 2:1
+                logger.warning(f"⚠️ Skipping trade for {symbol} due to poor risk-reward ratio: {risk_reward_ratio:.2f}")
+                return
+
+            # Calculate position size
+            position_size = self.calculate_position_size(symbol, risk_percent=0.01)  # Reduced risk to 1%
+            if position_size is None:
+                logger.error(f"❌ Invalid position size for {symbol}. Skipping trade.")
+                return
+
+            # Check margin requirements
+            symbol_info = mt5.symbol_info(symbol)
+            margin_required = position_size * symbol_info.margin_initial
+            if margin_required > account_info.margin_free:
+                logger.error(f"❌ Insufficient margin for {symbol}. Required: {margin_required}, Free: {account_info.margin_free}")
+                return
+
+            logger.info(f"📊 Trade Details for {symbol}:")
+            logger.info(f"  - Position Size: {position_size}")
+            logger.info(f"  - Margin Required: {margin_required}")
+            logger.info(f"  - Free Margin: {account_info.margin_free}")
+
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": position_size,
+                "type": mt5.ORDER_TYPE_BUY if order_type == 0 else mt5.ORDER_TYPE_SELL,
+                "price": price,
+                "sl": stop_loss,
+                "tp": take_profit,
+                "deviation": 10,
+                "magic": 123456,
+                "comment": "AI Trading Bot",
+            }
+
+            result = mt5.order_send(request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                logger.info(f"✅ Trade Executed: {symbol} | Volume: {position_size} | SL: {stop_loss:.5f} | TP: {take_profit:.5f}")
+            else:
+                logger.error(f"❌ Trade execution failed for {symbol}. Error: {result.comment}")
+        except Exception as e:
+            logger.error(f"❌ Unexpected error in place_trade for {symbol}: {e}")
+
+# ✅ Train LightGBM Model if it doesn't exist
+def train_lgb_model():
+    def balance_dataset(trade_data):
+        buy_trades = trade_data[trade_data['Type'] == 'Buy']
+        sell_trades = trade_data[trade_data['Type'] == 'Sell']
+        min_size = min(len(buy_trades), len(sell_trades))
+        balanced_data = pd.concat([buy_trades.sample(min_size, random_state=42), sell_trades.sample(min_size, random_state=42)])
+        return balanced_data
+
+    if not os.path.exists("lgb_model.txt"):
+        logger.info("🚀 Training LightGBM Model...")
+        trade_data = pd.read_csv("trade_history.csv")
+        trade_data = balance_dataset(trade_data)  # Ensure balanced Buy/Sell data
+        if trade_data.empty:
+            logger.error("❌ No trade history available for training.")
+            return
+        
+        # Update feature columns to include all 10 features
+        feature_columns = [
+            "RSI", "MACD", "ATR", "ADX", "VWAP", "Correlation", 
+            "News_Sentiment", "Volatility", "Seasonal_Trend", "Order_Flow"
+        ]
+        X = trade_data[feature_columns].values
+        y = (trade_data["Profit"] > 0).astype(int).values  # Convert to binary classification
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        train_data = lgb.Dataset(X_train, label=y_train)
+        test_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
+        
+        params = {
+            'objective': 'binary',
+            'metric': 'binary_logloss',
+            'boosting_type': 'gbdt',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.9
+        }
+        
+        model = lgb.train(params, train_data, valid_sets=[test_data], num_boost_round=100)
+        model.save_model("lgb_model.txt")
+        logger.info("✅ LightGBM Model Training Completed & Saved!")
+
+train_lgb_model()
+
+# ✅ Run the Bot
+bot = TradingAI()
+try:
+    while True:
+        if bot.check_economic_events():
+            time.sleep(60 * 60)  # Wait 1 hour before checking again
+            continue
+
+        for symbol in ["EURUSD", "USDCHF", "GBPUSD", "USDJPY"]:
+            features = bot.get_features(symbol)
+            if features is not None:
+                trend_direction = bot.ensemble_prediction(features)
+                bot.place_trade(trend_direction, symbol)
+            else:
+                logger.error(f"❌ Skipping trade for {symbol} due to insufficient data.")
+        time.sleep(60)  # Wait 1 minute before the next iteration
+except KeyboardInterrupt:
+    logger.info("\n🛑 Stopping the bot safely...")
+    mt5.shutdown()
+    logger.info("✅ Bot stopped gracefully!")
